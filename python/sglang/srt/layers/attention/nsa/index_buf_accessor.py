@@ -375,7 +375,9 @@ def _set_k_and_s_triton(
         assert page_size == 64
 
     assert buf.dtype == torch.uint8
-    assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
+    # [PATCH-9] loc.dtype int32-tolerant — original author already noted
+    # "# can be int32" but kept the strict assertion. Relaxed for disagg.
+    assert loc.dtype in (torch.int32, torch.int64), f"{loc.dtype=}"
     if _is_fp8_fnuz:
         assert index_k.dtype == torch.float8_e4m3fnuz
     else:

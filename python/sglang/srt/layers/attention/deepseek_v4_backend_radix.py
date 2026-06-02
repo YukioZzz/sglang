@@ -128,8 +128,14 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
-    import flash_mla
-
+    # [PATCH-7] flash_mla import-tolerant. The rocm/sgl-dev DSv4 image
+    # doesn't ship flash_mla (CUDA-only). On HIP, the attention compute
+    # routes to dpsk_v4_fp8_attention_fwd (tilelang) and ignores this
+    # metadata. None is already a valid value at line ~1220-1221 below.
+    try:
+        import flash_mla
+    except ImportError:
+        return None
     return flash_mla.get_mla_metadata()[0]
 
 

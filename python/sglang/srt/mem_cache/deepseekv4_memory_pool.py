@@ -634,6 +634,32 @@ class DeepSeekV4TokenToKVPool(KVCache):
             self.compress_state_pools.append(compress_state_pool)
             self.indexer_compress_state_pools.append(indexer_compress_state_pool)
 
+        # [PATCH-6b] identity full_to_swa_index_mapping. See Option-3 notes
+        # in dsv4_disagg_patch.sh for why identity is correct for DSv4.
+        # Layout matches SWATokenToKVPoolAllocator.__init__ (line ~290 of
+        # swa_memory_pool.py): [0..size+page-1] followed by a -1 sentinel,
+        # so mapping[-1] still maps -1 → -1 for alloc_extend's last_loc=-1.
+        if getattr(self, 'full_to_swa_index_mapping', None) is None:
+            import torch as _torch_patch
+            _patch_size = int(getattr(self, 'swa_size', 0) or 0)
+            _patch_page = int(getattr(self, 'swa_page_size', 0) or 0) or int(getattr(self, 'page_size', 1))
+            _patch_dev = getattr(self, 'device', 'cpu')
+            _patch_n = _patch_size + _patch_page
+            self.full_to_swa_index_mapping = _torch_patch.cat([
+                _torch_patch.arange(_patch_n, dtype=_torch_patch.int64, device=_patch_dev),
+                _torch_patch.tensor([-1], dtype=_torch_patch.int64, device=_patch_dev),
+            ])
+            import logging as _logging_patch
+            _logging_patch.getLogger(__name__).warning(
+                '[DSv4-DISAGG-PATCH-6b] Seeded IDENTITY full_to_swa_index_mapping '
+                'on %s (numel=%d, size=%d, page=%d, device=%s, first8=%s, last4=%s)',
+                self.__class__.__name__,
+                self.full_to_swa_index_mapping.numel(),
+                _patch_size, _patch_page, str(_patch_dev),
+                self.full_to_swa_index_mapping[:8].tolist(),
+                self.full_to_swa_index_mapping[-4:].tolist(),
+            )
+
     def _init_compressed_layer_mapping(self):
         c1_cnt, c4_cnt, c128_cnt = 0, 0, 0
         self.layer_mapping: List[DeepSeekV4LayerItem] = []

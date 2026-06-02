@@ -68,6 +68,10 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     is_dummy: bool
+    # [PATCH-12-v2] dsv4 state plumbing — SWA-page indices receiver pre-allocated
+    dst_state_indices: npt.NDArray[np.int32] = dataclasses.field(
+        default_factory=lambda: np.array([], dtype=np.int32)
+    )
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -86,6 +90,14 @@ class TransferInfo:
         else:
             dst_aux_index = -1
 
+        # [PATCH-12-v2] decode state_indices from the long-reserved-but-empty
+        # state_bytes slot at payload[6]. .copy() makes the buffer owned
+        # so the original zmq frame can be released.
+        if len(payload) > 6 and payload[6]:
+            dst_state_indices = np.frombuffer(payload[6], dtype=np.int32).copy()
+        else:
+            dst_state_indices = np.array([], dtype=np.int32)
+
         required_dst_info_num = (
             int(payload[7].decode("ascii")) if len(payload) > 7 else 1
         )
@@ -99,6 +111,7 @@ class TransferInfo:
             dst_aux_index=dst_aux_index,
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
+            dst_state_indices=dst_state_indices,  # [PATCH-12-v2]
         )
 
 
@@ -487,11 +500,136 @@ class MoriKVManager(CommonKVManager):
         src_groups: List[List[int]],
         dst_groups: List[List[int]],
     ) -> List[TransferStatus]:
+        # [PATCH-LAYER-SWA] dsv4 layer swa-wrap + diag
+        # Detect SWA-sized layers by comparing this layer's src_desc.size
+        # against the largest layer MR size cached on first call. For SWA
+        # layers wrap slot ids via modulo with min(src_cap, dst_cap) so
+        # both sides land at the SAME relative SWA slot; emit singleton
+        # WRs (one per slot) since modulo breaks contiguity assumptions.
+        # Non-SWA layers go through the original fast path.
         if not src_groups:
             return []
-        local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
-        remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
-        sizes = [len(src_group) * kv_item_len for src_group in src_groups]
+
+        try:
+            _layer_diag_bw = int(os.environ.get("DSV4_LAYER_DIAG_BATCHWRITE", "0"))
+        except Exception:
+            _layer_diag_bw = 0
+        try:
+            _layer_diag_failed = int(os.environ.get("DSV4_LAYER_DIAG_FAILED", "1"))
+        except Exception:
+            _layer_diag_failed = 1
+        try:
+            _layer_diag_every = int(os.environ.get("DSV4_LAYER_DIAG_EVERY", "100"))
+        except Exception:
+            _layer_diag_every = 100
+        if _layer_diag_every <= 0:
+            _layer_diag_every = 1
+        try:
+            _swa_wrap_enabled = int(os.environ.get("DSV4_LAYER_SWA_WRAP", "1"))
+        except Exception:
+            _swa_wrap_enabled = 1
+
+        _layer_call_idx = getattr(self, "_layer_diag_call_idx", 0)
+        self._layer_diag_call_idx = _layer_call_idx + 1
+
+        # Lazily cache the largest local kv_mem_desc size so we can
+        # classify per-layer descs as SWA vs full at runtime.
+        _ref_size = getattr(self, "_max_kv_mem_desc_size", None)
+        if _ref_size is None:
+            try:
+                _ref_size = max(
+                    (int(getattr(d, "size", 0) or 0)
+                     for d in getattr(self, "kv_mem_descs", []) or []),
+                    default=0,
+                )
+            except Exception:
+                _ref_size = 0
+            self._max_kv_mem_desc_size = _ref_size
+
+        try:
+            _src_size = int(getattr(src_desc, "size", 0) or 0)
+            _dst_size = int(getattr(dst_desc, "size", 0) or 0)
+            _src_id = int(getattr(src_desc, "id", -1) or -1)
+            _dst_id = int(getattr(dst_desc, "id", -1) or -1)
+        except Exception:
+            _src_size = _dst_size = _src_id = _dst_id = -1
+
+        _is_swa_layer = bool(
+            _swa_wrap_enabled and _ref_size > 0
+            and _src_size > 0 and _src_size < _ref_size
+            and kv_item_len > 0
+        )
+
+        if _is_swa_layer:
+            # Wrap into common SWA slot space.
+            _src_cap = _src_size // kv_item_len
+            _dst_cap = _dst_size // kv_item_len if _dst_size > 0 else _src_cap
+            _swa_cap = min(_src_cap, _dst_cap)
+            if _swa_cap <= 0:
+                # Degenerate: fall back to original path to keep behavior.
+                _is_swa_layer = False
+
+        if _is_swa_layer:
+            # Singleton WRs, modulo-wrapped both sides.
+            local_offsets = []
+            remote_offsets = []
+            sizes = []
+            _src_max_full = -1
+            _dst_max_full = -1
+            for _src_grp, _dst_grp in zip(src_groups, dst_groups):
+                for _s, _d in zip(_src_grp, _dst_grp):
+                    _s_int = int(_s)
+                    _d_int = int(_d)
+                    if _s_int > _src_max_full:
+                        _src_max_full = _s_int
+                    if _d_int > _dst_max_full:
+                        _dst_max_full = _d_int
+                    local_offsets.append((_s_int % _swa_cap) * kv_item_len)
+                    remote_offsets.append((_d_int % _swa_cap) * kv_item_len)
+                    sizes.append(kv_item_len)
+            if not sizes:
+                return []
+        else:
+            # Original (full-pool) path — unchanged from upstream.
+            local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
+            remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
+            sizes = [len(src_group) * kv_item_len for src_group in src_groups]
+
+        # Permanent pre-flight bounds assertion: mirror MoRI's C++ check
+        # (common.cpp:334) BEFORE we hand WRs to the engine. With the SWA
+        # wrap above + identity full_to_swa mapping (patch 6b), this should
+        # never trip on healthy traffic; any True->False transition is a
+        # regression and aborts loudly instead of producing 8000+ MoRI
+        # [io][error] entries from the bounds-violating WRs.
+        # Knob DSV4_LAYER_PREFLIGHT_STRICT=0 downgrades to a warning.
+        try:
+            _pre_local_max = max(
+                (lo + sz for lo, sz in zip(local_offsets, sizes)), default=0
+            )
+            _pre_remote_max = max(
+                (ro + sz for ro, sz in zip(remote_offsets, sizes)), default=0
+            )
+        except Exception:
+            _pre_local_max = _pre_remote_max = -1
+        _pre_pass = (
+            _pre_local_max <= _src_size and _pre_remote_max <= _dst_size
+        ) if (_src_size > 0 and _dst_size > 0) else True
+        if not _pre_pass:
+            try:
+                _strict = int(os.environ.get("DSV4_LAYER_PREFLIGHT_STRICT", "1"))
+            except Exception:
+                _strict = 1
+            _err_msg = (
+                "[PATCH-LAYER-SWA PREFLIGHT] OOB: "
+                "src_id=%d dst_id=%d src_size=%d dst_size=%d swa=%s "
+                "local_max=%d remote_max=%d n_wrs=%d kv_item_len=%d"
+            ) % (
+                _src_id, _dst_id, _src_size, _dst_size, _is_swa_layer,
+                _pre_local_max, _pre_remote_max, len(sizes), kv_item_len,
+            )
+            if _strict:
+                raise RuntimeError(_err_msg)
+            logger.error(_err_msg)
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
@@ -503,6 +641,88 @@ class MoriKVManager(CommonKVManager):
             [sizes],
             [transfer_uid],
         )
+
+        if not (_layer_diag_bw or _layer_diag_failed) or not statuses:
+            return statuses
+
+        def _is_ok(_st):
+            # Mirror of DIAG-V4 detection in _transfer_state_buffers; cached.
+            _det = getattr(self, "_p12v2_status_detect", None)
+            if _det is None:
+                try:
+                    if callable(getattr(_st, 'Failed', None)):
+                        self._p12v2_status_detect = 'not_Failed()'
+                        return not bool(_st.Failed())
+                    if callable(getattr(_st, 'Succeeded', None)):
+                        self._p12v2_status_detect = 'Succeeded()'
+                        return bool(_st.Succeeded())
+                except Exception:
+                    return True
+                self._p12v2_status_detect = 'fallback_assume_ok'
+                return True
+            try:
+                if _det == 'not_Failed()':
+                    return not bool(_st.Failed())
+                if _det == 'Succeeded()':
+                    return bool(_st.Succeeded())
+                return True
+            except Exception:
+                return True
+
+        try:
+            _n_ok = sum(1 for _s in statuses if _is_ok(_s))
+        except Exception:
+            _n_ok = -1
+        _n_bad = (len(statuses) - _n_ok) if _n_ok >= 0 else -1
+
+        try:
+            _local_max = max((lo + sz for lo, sz in zip(local_offsets, sizes)), default=0)
+            _remote_max = max((ro + sz for ro, sz in zip(remote_offsets, sizes)), default=0)
+        except Exception:
+            _local_max = _remote_max = -1
+        _python_check_pass = (
+            _local_max <= _src_size and _remote_max <= _dst_size
+        ) if (_src_size > 0 and _dst_size > 0) else True
+
+        if _layer_diag_bw and (_layer_call_idx % _layer_diag_every == 0):
+            try:
+                logger.warning(
+                    "[PATCH-LAYER-SWA BW] call#%d uid=%d src_id=%d dst_id=%d "
+                    "src_size=%d dst_size=%d swa=%s n_wrs=%d ok=%d bad=%d "
+                    "local_max=%d remote_max=%d py_pass=%s",
+                    _layer_call_idx, int(transfer_uid), _src_id, _dst_id,
+                    _src_size, _dst_size, _is_swa_layer, len(sizes), _n_ok, _n_bad,
+                    _local_max, _remote_max, _python_check_pass,
+                )
+            except Exception as _e:
+                logger.warning("[PATCH-LAYER-SWA BW] log error: %s", _e)
+
+        if _layer_diag_failed and _n_bad and _n_bad > 0:
+            try:
+                _code = -1
+                _msg = ""
+                for _st in statuses:
+                    if not _is_ok(_st):
+                        try:
+                            _code = int(_st.Code())
+                            _msg = str(_st.Message())[:80]
+                        except Exception:
+                            pass
+                        break
+                logger.warning(
+                    "[PATCH-LAYER-SWA FAIL] call#%d uid=%d src_id=%d dst_id=%d "
+                    "src_size=%d dst_size=%d swa=%s n_wrs=%d bad=%d/%d "
+                    "local_max=%d remote_max=%d py_pass=%s code=%d msg=%r "
+                    "local_offs_head=%s remote_offs_head=%s sizes_head=%s",
+                    _layer_call_idx, int(transfer_uid), _src_id, _dst_id,
+                    _src_size, _dst_size, _is_swa_layer, len(sizes), _n_bad, len(statuses),
+                    _local_max, _remote_max, _python_check_pass, _code, _msg,
+                    list(local_offsets[:4]), list(remote_offsets[:4]),
+                    list(sizes[:4]),
+                )
+            except Exception as _e:
+                logger.warning("[PATCH-LAYER-SWA FAIL] log error: %s", _e)
+
         return statuses
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
@@ -782,6 +1002,439 @@ class MoriKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
+    # [PATCH-12-v2] dsv4 sparse state-buffer transfer ------------------
+    def _transfer_state_buffers(
+        self,
+        peer_info: "KVArgsRegisterInfo",
+        src_state_indices: npt.NDArray[np.int32],
+        dst_state_indices: npt.NDArray[np.int32],
+    ) -> List[TransferStatus]:
+        """Per-segment, page-indexed transfer of DSv4 state pools
+        (compress + indexer compress).  Both index arrays must be in
+        SWA-page space — prefill.py / decode.py [PATCH-13] is
+        responsible for translating full-pool indices via
+        ``translate_loc_from_full_to_swa`` before calling."""
+        statuses: List[TransferStatus] = []
+        try:
+            src_descs = list(getattr(self, "state_mem_descs", None) or [])
+            dst_descs = list(getattr(peer_info, "dst_state_mem_descs", None) or [])
+            item_lens = list(getattr(self.kv_args, "state_item_lens", None) or [])
+        except Exception:
+            return statuses
+        if not src_descs or not dst_descs or not item_lens:
+            return statuses
+        # [PATCH-12-v2 / Option-3] singleton groups (one page per WR).
+        # Rationale: MoRI's per-WR message-length limit is exceeded when
+        # state transfers use contiguous groups (e.g. [4,5,6,7] -> a
+        # single WR of 4*item_len bytes; with item_len=524288 for c128
+        # that is ~2 MB per WR, which MoRI rejects with 'message length
+        # out of range'). v2 (all-zeros mapping) accidentally worked
+        # because [0,0,0,0] is not arithmetically contiguous and
+        # group_concurrent_contiguous emitted 4 singleton groups.
+        # Option-3 explicitly keeps singletons regardless of index
+        # contiguity. WR count grows to len(state_indices) per segment,
+        # but each WR stays at 1*item_len bytes (same shape MoRI's main
+        # KV channel uses successfully on non-DSv4 models).
+        src_list = [int(p) for p in src_state_indices.tolist()]
+        dst_list = [int(p) for p in dst_state_indices.tolist()]
+        if len(src_list) != len(dst_list):
+            logger.warning(
+                "[PATCH-12-v2] state_indices length mismatch: "
+                "src=%d dst=%d; truncating to shorter",
+                len(src_list), len(dst_list),
+            )
+            _m = min(len(src_list), len(dst_list))
+            src_list, dst_list = src_list[:_m], dst_list[:_m]
+        if not src_list:
+            return statuses
+        # [PATCH-12-v2 / DIAG-V3] per-request counter (replaces _p12v2_logged
+        # one-shot flag). Set DSV4_STATE_DIAG_EVERY=N to log every Nth call;
+        # call #0 is always logged. We deliberately keep this OUTSIDE the
+        # lock-guarded region so periodic diag fires even when lock is on.
+        _call_idx = int(getattr(self, "_p12v2_call_idx", 0))
+        self._p12v2_call_idx = _call_idx + 1
+        try:
+            _diag_every = int(os.environ.get("DSV4_STATE_DIAG_EVERY", "0"))
+        except Exception:
+            _diag_every = 0
+        _should_diag = (
+            _call_idx == 0
+            or (_diag_every > 0 and (_call_idx % _diag_every) == 0)
+        )
+        _did_log = not _should_diag
+        # [PATCH-12-v2 / Option-3 size gate] Optional cap to skip segments
+        # whose per-page (item_len) bytes exceed the MoRI/IB per-WR limit.
+        # Setting DSV4_STATE_MAX_ITEM_LEN=524288 effectively excludes c128
+        # indexer compress-state segments (il=1 MB) while keeping SWA KV
+        # (146 KB), c4 compress state (128 KB) and the 32 KB tail segments
+        # included. Used to A/B test whether MoRI's 'message length out of
+        # range' is driven by per-WR size vs MR-layout/offset constraints.
+        try:
+            _max_il = int(os.environ.get("DSV4_STATE_MAX_ITEM_LEN", "0"))
+        except Exception:
+            _max_il = 0
+        try:
+            _chunk_cap = int(os.environ.get("DSV4_STATE_CHUNK_CAP_BYTES", "0"))
+        except Exception:
+            _chunk_cap = 0
+        try:
+            _agg_call = int(os.environ.get("DSV4_STATE_AGGREGATE_BATCH", "1"))
+        except Exception:
+            _agg_call = 1
+        _skipped_total = 0
+        _kept_total = 0
+        _chunked_total = 0
+        # [PATCH-12-v2 / Option-3 aggregation] Accumulate per-segment
+        # offset/size lists into outer lists, then issue ONE batch_write
+        # for the whole request instead of 152 calls. MoRI's batch_write
+        # accepts (List[MemoryDesc], List[List[offset]], ...) so multiple
+        # descriptors can be submitted in a single engine call.  Conc>1
+        # failure was traced to 4 concurrent requests issuing ~608
+        # batch_write calls in parallel across 4 MoRI IO threads which
+        # overflowed something internal. One call per request keeps the
+        # call frequency identical to upstream send_kvcache (one call per
+        # layer there — same order of magnitude as one per request here).
+        agg_src_descs = []
+        agg_dst_descs = []
+        agg_local_offsets = []
+        agg_remote_offsets = []
+        agg_sizes = []
+        agg_xuids = []
+        agg_seg_idx = []
+        n = min(len(src_descs), len(dst_descs), len(item_lens))
+        for idx in range(n):
+            item_len = int(item_lens[idx])
+            if item_len <= 0:
+                continue
+            if _max_il > 0 and item_len > _max_il:
+                _skipped_total += 1
+                continue
+            _kept_total += 1
+            if (not _did_log) and idx == 0:
+                src_total = int(getattr(src_descs[idx], "size", 0) or 0)
+                dst_total = int(getattr(dst_descs[idx], "size", 0) or 0)
+                logger.warning(
+                    "[PATCH-12-v2 DIAG-V3 call#%d seg0] item_len=%d "
+                    "npages=%d src_total=%d dst_total=%d "
+                    "max_src_page=%d max_dst_page=%d",
+                    _call_idx, item_len, len(src_list), src_total, dst_total,
+                    int(src_state_indices.max()) if src_state_indices.size else -1,
+                    int(dst_state_indices.max()) if dst_state_indices.size else -1,
+                )
+            # Build (local_offsets, remote_offsets, sizes) lists for THIS
+            # segment. Chunk when item_len exceeds the per-WR cap.
+            _local_off: List[int] = []
+            _remote_off: List[int] = []
+            _sizes: List[int] = []
+            if _chunk_cap > 0 and item_len > _chunk_cap:
+                _chunked_total += 1
+                for _sp, _dp in zip(src_list, dst_list):
+                    _base_src = _sp * item_len
+                    _base_dst = _dp * item_len
+                    _remaining = item_len
+                    _off = 0
+                    while _remaining > 0:
+                        _sz = _chunk_cap if _remaining > _chunk_cap else _remaining
+                        _local_off.append(_base_src + _off)
+                        _remote_off.append(_base_dst + _off)
+                        _sizes.append(_sz)
+                        _off += _sz
+                        _remaining -= _sz
+            else:
+                for _sp, _dp in zip(src_list, dst_list):
+                    _local_off.append(_sp * item_len)
+                    _remote_off.append(_dp * item_len)
+                    _sizes.append(item_len)
+            agg_src_descs.append(src_descs[idx])
+            agg_dst_descs.append(dst_descs[idx])
+            agg_local_offsets.append(_local_off)
+            agg_remote_offsets.append(_remote_off)
+            agg_sizes.append(_sizes)
+            agg_xuids.append(self.engine.allocate_transfer_uid())
+            agg_seg_idx.append(idx)
+        # [PATCH-12-v2 / DIAG-V3] optional lock acquisition to serialize
+        # batch_write across MoRI sender threads. DSV4_STATE_SERIALIZE=1.
+        try:
+            _do_lock = int(os.environ.get("DSV4_STATE_SERIALIZE", "0"))
+        except Exception:
+            _do_lock = 0
+        _lock_p12v2 = None
+        if _do_lock and agg_src_descs:
+            _lock_p12v2 = getattr(self, "_p12v2_state_lock", None)
+            if _lock_p12v2 is None:
+                import threading as _threading_p12v2
+                _lock_p12v2 = _threading_p12v2.Lock()
+                self._p12v2_state_lock = _lock_p12v2
+        _batch_statuses: list = []
+        if _lock_p12v2 is not None:
+            _lock_p12v2.acquire()
+        try:
+            if agg_src_descs:
+                if _agg_call:
+                    _batch_statuses = list(self.engine.batch_write(
+                        agg_src_descs, agg_local_offsets,
+                        agg_dst_descs, agg_remote_offsets,
+                        agg_sizes, agg_xuids,
+                    ))
+                else:
+                    for _i in range(len(agg_src_descs)):
+                        _batch_statuses.extend(self.engine.batch_write(
+                            [agg_src_descs[_i]], [agg_local_offsets[_i]],
+                            [agg_dst_descs[_i]], [agg_remote_offsets[_i]],
+                            [agg_sizes[_i]], [agg_xuids[_i]],
+                        ))
+                statuses.extend(_batch_statuses)
+        finally:
+            if _lock_p12v2 is not None:
+                _lock_p12v2.release()
+        if not _did_log:
+            logger.warning(
+                "[PATCH-12-v2 DIAG-V3 call#%d] kept=%d skipped=%d "
+                "chunked=%d agg=%d lock=%d total_descs=%d total_WRs=%d "
+                "cap=%d max_il=%d",
+                _call_idx, _kept_total, _skipped_total, _chunked_total,
+                _agg_call, _do_lock, len(agg_src_descs),
+                sum(len(s) for s in agg_sizes),
+                _chunk_cap, _max_il,
+            )
+        # [PATCH-12-v2 / DIAG-V4] failure dump using REAL TransferStatus API.
+        # DIAG-V3's repr-substring fallback ('OK' / 'SUCCESS' in repr) was a
+        # false-positive trap because pybind11's TransferStatus has no
+        # __repr__ override -- repr is '<libmori_pybinds.TransferStatus
+        # object at 0x...>', which contains 'OBJECT' but not the literals
+        # we matched on, so EVERY status was flagged 'bad'. V4 introspects
+        # the first status with dir() and picks the right detection method
+        # (is_ok / ok / code / int / success), caches it on self, and uses
+        # it for all subsequent calls. The chosen method is logged so we
+        # can verify by hand. DSV4_STATE_DIAG_FAILED=0 to silence.
+        # DSV4_STATE_DIAG_BATCHWRITE=1 enables a per-call BW summary log
+        # (ok/bad count + uid range) regardless of failure presence -- used
+        # to correlate our submissions with MoRI's [io][error] log stream
+        # by timestamp.
+        try:
+            _diag_failed = int(os.environ.get("DSV4_STATE_DIAG_FAILED", "1"))
+        except Exception:
+            _diag_failed = 1
+        try:
+            _diag_bw = int(os.environ.get("DSV4_STATE_DIAG_BATCHWRITE", "0"))
+        except Exception:
+            _diag_bw = 0
+
+        def _p12v2_is_ok(_status):
+            # Real libmori_pybinds.TransferStatus API (probed on-cluster):
+            #   .Code()       -> StatusCode enum (INIT=1, ...)
+            #   .Message()    -> str (empty when no error)
+            #   .Init()       -> bool (True freshly constructed)
+            #   .InProgress() -> bool
+            #   .Succeeded()  -> bool
+            #   .Failed()     -> bool   <-- True iff actually broken
+            #   .Wait()       -> blocks until terminal state
+            # Right after batch_write returns, statuses are mostly
+            # InProgress (async submitted) plus any pre-flight failures
+            # which immediately go to Failed(). MoRI's [io][error] for
+            # 'message length out of range' is the SYNCHRONOUS pre-flight
+            # bounds check -- the bad WR's status will already be Failed()
+            # when batch_write returns. So 'not Failed()' is the right
+            # check for our diagnostic.
+            _det = getattr(self, "_p12v2_status_detect", None)
+            if _det is None:
+                _members = [m for m in dir(_status) if not m.startswith('_')]
+                _det = 'fallback_assume_ok'
+                _ok = True
+                # Probe runtime values for diagnostic ground-truth dump.
+                _runtime_vals = {}
+                for _name in ('Code', 'Message', 'Init', 'InProgress',
+                              'Succeeded', 'Failed'):
+                    try:
+                        _fn = getattr(_status, _name, None)
+                        if callable(_fn):
+                            _runtime_vals[_name + '()'] = repr(_fn())[:80]
+                    except Exception as _e:
+                        _runtime_vals[_name + '()'] = 'ERR ' + type(_e).__name__
+                # Detection priority: not Failed() (best -- only flags real
+                # failures), then Succeeded() (treats InProgress as bad,
+                # which would flood; only use if Failed missing), then the
+                # generic fallbacks we kept from earlier.
+                _fn = getattr(_status, 'Failed', None)
+                if callable(_fn):
+                    try:
+                        _ok = not bool(_fn())
+                        _det = 'not_Failed()'
+                    except Exception:
+                        pass
+                if _det == 'fallback_assume_ok':
+                    _fn = getattr(_status, 'Succeeded', None)
+                    if callable(_fn):
+                        try:
+                            _ok = bool(_fn())
+                            _det = 'Succeeded()'
+                        except Exception:
+                            pass
+                if _det == 'fallback_assume_ok':
+                    for _name in ('is_ok', 'ok'):
+                        _fn = getattr(_status, _name, None)
+                        if callable(_fn):
+                            try:
+                                _ok = bool(_fn())
+                                _det = _name + '()'
+                                break
+                            except Exception:
+                                continue
+                self._p12v2_status_detect = _det
+                logger.warning(
+                    "[PATCH-12-v2 DIAG-V4 STATUS-API] type=%s repr=%r "
+                    "members=%s runtime=%s chosen=%s first_ok=%s",
+                    type(_status).__name__, repr(_status), _members,
+                    _runtime_vals, _det, _ok,
+                )
+                return _ok
+            try:
+                if _det == 'not_Failed()':
+                    return not bool(_status.Failed())
+                if _det == 'Succeeded()':
+                    return bool(_status.Succeeded())
+                if _det.endswith('()'):
+                    _name = _det[:-2]
+                    return bool(getattr(_status, _name)())
+            except Exception:
+                return True
+            return True
+
+        def _p12v2_status_dump(_status):
+            # Compact dump for a single status: Code, Message, Failed, etc.
+            _info = {}
+            for _name in ('Code', 'Message', 'Failed', 'Succeeded',
+                          'InProgress', 'Init'):
+                try:
+                    _fn = getattr(_status, _name, None)
+                    if callable(_fn):
+                        _info[_name] = repr(_fn())[:120]
+                except Exception:
+                    pass
+            return _info
+
+        # Pre-compute uid range / wr total once, reuse for both BW summary
+        # log and FAIL dump.
+        try:
+            _uid_lo = int(min(agg_xuids)) if agg_xuids else -1
+            _uid_hi = int(max(agg_xuids)) if agg_xuids else -1
+        except Exception:
+            _uid_lo = _uid_hi = -1
+        try:
+            _total_wrs = sum(len(s) for s in agg_sizes)
+        except Exception:
+            _total_wrs = -1
+
+        if _diag_bw and _batch_statuses:
+            try:
+                _bw_n_ok = sum(1 for _s in _batch_statuses if _p12v2_is_ok(_s))
+                _bw_n_bad = len(_batch_statuses) - _bw_n_ok
+                logger.warning(
+                    "[PATCH-12-v2 DIAG-V4 BW] call#%d n_descs=%d total_wrs=%d "
+                    "uid_range=[%d,%d] uid_span=%d ok=%d bad=%d",
+                    _call_idx, len(agg_src_descs), _total_wrs,
+                    _uid_lo, _uid_hi, _uid_hi - _uid_lo,
+                    _bw_n_ok, _bw_n_bad,
+                )
+            except Exception as _e:
+                logger.warning("[PATCH-12-v2 DIAG-V4 BW] log error: %s", _e)
+
+        if _diag_failed and _batch_statuses:
+            _bad_descs = 0
+            _first_bad = None
+            _bad_seg_idxs: List[int] = []
+            _by_code_msg: Dict[str, int] = {}
+            _python_check_pass_count = 0  # bad descs whose Python mirror passed
+            for _di, _st in enumerate(_batch_statuses):
+                if _p12v2_is_ok(_st):
+                    continue
+                _bad_descs += 1
+                if _di < len(agg_seg_idx):
+                    _bad_seg_idxs.append(int(agg_seg_idx[_di]))
+                try:
+                    _c = int(_st.Code())
+                    _m = str(_st.Message())[:80]
+                    _key = "code=%d msg=%r" % (_c, _m)
+                    _by_code_msg[_key] = _by_code_msg.get(_key, 0) + 1
+                except Exception:
+                    pass
+                # Python-side mirror of C++ bounds check (per-desc).
+                if _di < len(agg_src_descs):
+                    try:
+                        _src_size_pc = int(getattr(agg_src_descs[_di], "size", 0) or 0)
+                        _dst_size_pc = int(getattr(agg_dst_descs[_di], "size", 0) or 0)
+                        _lops_pc = max(
+                            (lo + s for lo, s in zip(agg_local_offsets[_di], agg_sizes[_di])),
+                            default=0,
+                        )
+                        _rops_pc = max(
+                            (ro + s for ro, s in zip(agg_remote_offsets[_di], agg_sizes[_di])),
+                            default=0,
+                        )
+                        if _lops_pc <= _src_size_pc and _rops_pc <= _dst_size_pc:
+                            _python_check_pass_count += 1
+                    except Exception:
+                        pass
+                if _first_bad is None and _di < len(agg_src_descs):
+                    _seg = agg_seg_idx[_di]
+                    _il = int(item_lens[_seg])
+                    # Python-side mirror of C++ bounds check at
+                    # common.cpp:334: per-WR (off+sz) must be <= MR.length.
+                    # We mirror it using desc.size, which is the size that
+                    # Python registered via RegisterMemory. If THIS check
+                    # PASSES while C++ returns 'length out of range', the
+                    # C++ side's cached RdmaMemoryRegion.length disagrees
+                    # with desc.size -- a smoking-gun signature of the
+                    # 'remote.length=0 cached' race that MoRI's release
+                    # build silently swallows (assert at backend_impl.cpp:
+                    # 1129 is elided under -O3 -DNDEBUG).
+                    _src_size = int(getattr(agg_src_descs[_di], "size", 0) or 0)
+                    _dst_size = int(getattr(agg_dst_descs[_di], "size", 0) or 0)
+                    _local_off_plus_sz_max = max(
+                        (lo + s for lo, s in zip(agg_local_offsets[_di], agg_sizes[_di])),
+                        default=0,
+                    )
+                    _remote_off_plus_sz_max = max(
+                        (ro + s for ro, s in zip(agg_remote_offsets[_di], agg_sizes[_di])),
+                        default=0,
+                    )
+                    _python_check_pass = (
+                        _local_off_plus_sz_max <= _src_size
+                        and _remote_off_plus_sz_max <= _dst_size
+                    )
+                    _first_bad = {
+                        "call": _call_idx,
+                        "desc_idx": _di,
+                        "seg_idx": _seg,
+                        "item_len": _il,
+                        "uid": int(agg_xuids[_di]),
+                        "src_id": int(getattr(agg_src_descs[_di], "id", -1) or -1),
+                        "dst_id": int(getattr(agg_dst_descs[_di], "id", -1) or -1),
+                        "src_size": _src_size,
+                        "dst_size": _dst_size,
+                        "local_off_plus_sz_max": _local_off_plus_sz_max,
+                        "remote_off_plus_sz_max": _remote_off_plus_sz_max,
+                        "python_check_pass": _python_check_pass,
+                        "local_offs_head": list(agg_local_offsets[_di][:4]),
+                        "remote_offs_head": list(agg_remote_offsets[_di][:4]),
+                        "sizes_head": list(agg_sizes[_di][:4]),
+                        "local_off_max": max(agg_local_offsets[_di]) if agg_local_offsets[_di] else -1,
+                        "remote_off_max": max(agg_remote_offsets[_di]) if agg_remote_offsets[_di] else -1,
+                        "size_max": max(agg_sizes[_di]) if agg_sizes[_di] else -1,
+                        "n_wrs": len(agg_sizes[_di]),
+                        "status_api": _p12v2_status_dump(_st),
+                    }
+            if _bad_descs > 0:
+                logger.warning(
+                    "[PATCH-12-v2 DIAG-V4 FAIL] call#%d bad_descs=%d/%d "
+                    "py_pass=%d uid_range=[%d,%d] by_code_msg=%s "
+                    "bad_seg_idxs=%s first_bad=%s",
+                    _call_idx, _bad_descs, len(_batch_statuses),
+                    _python_check_pass_count, _uid_lo, _uid_hi,
+                    _by_code_msg, _bad_seg_idxs[:30], _first_bad,
+                )
+        return statuses
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -817,6 +1470,21 @@ class MoriKVManager(CommonKVManager):
                         peer_info, kv_indices, dst_indices_chunk
                     )
                     result_statuses.extend(statuses)
+                    # [PATCH-12-v2] dsv4: transfer compress / indexer state
+                    # segments using SWA-page indices that prefill.py (patch 13)
+                    # computed and that the decode side handed us via the
+                    # state_bytes wire slot.
+                    dst_state_chunk = getattr(info, "dst_state_indices", None)
+                    if (
+                        state_indices is not None
+                        and len(state_indices) > 0
+                        and dst_state_chunk is not None
+                        and dst_state_chunk.size > 0
+                    ):
+                        state_statuses = self._transfer_state_buffers(
+                            peer_info, state_indices, dst_state_chunk
+                        )
+                        result_statuses.extend(state_statuses)
                 if (
                     is_last
                     and aux_index is not None
@@ -880,6 +1548,7 @@ class MoriKVSender(CommonKVSender):
             index_slice,
             is_last,
             aux_index=self.aux_index if is_last else None,
+            state_indices=state_indices,  # [PATCH-12-v2]
         )
         self.transfer_statuses.extend(statuses)
         if infos is not None:
@@ -1041,7 +1710,11 @@ class MoriKVReceiver(CommonKVReceiver):
             np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""
         )
         aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
-        state_bytes = b""
+        # [PATCH-12-v2] dsv4: populate the state-indices wire slot.
+        if state_indices is not None and len(state_indices) > 0:
+            state_bytes = np.asarray(state_indices, dtype=np.int32).tobytes()
+        else:
+            state_bytes = b""
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)

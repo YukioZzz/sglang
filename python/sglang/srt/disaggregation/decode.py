@@ -390,7 +390,24 @@ class DecodePreallocQueue:
                     kv_args.state_item_lens += draft_state_item_lens
 
             else:
-                kv_args.state_type = "none"
+                # [PATCH-10] dsv4 state_type: recognize DeepSeekV4TokenToKVPool
+                # so transfer backends know there ARE state buffers attached
+                # (SWA KV + compress_state_pools + indexer_compress_state_pools)
+                # instead of silently treating them as non-existent. MoRI is
+                # additionally patched (see [PATCH-11]) to actually RDMA-copy
+                # them since its send_kvcache only writes the main KV by default.
+                try:
+                    from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                        DeepSeekV4TokenToKVPool as _DSv4Pool_patch10,
+                    )
+                except Exception:
+                    _DSv4Pool_patch10 = None
+                if _DSv4Pool_patch10 is not None and isinstance(
+                    self.token_to_kv_pool, _DSv4Pool_patch10
+                ):
+                    kv_args.state_type = "dsv4"
+                else:
+                    kv_args.state_type = "none"
         else:
             kv_args.state_data_ptrs = []
             kv_args.state_data_lens = []
@@ -812,6 +829,17 @@ class DecodePreallocQueue:
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
                 state_indices = kv_to_page_indices(state_indices, device_page_size)
+            # [PATCH-13] dsv4 state_indices — see prefill.py for rationale.
+            elif type(self.token_to_kv_pool).__name__ == "DeepSeekV4TokenToKVPool":
+                _p13_seq_len = len(decode_req.req.origin_input_ids)
+                _p13_kv_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, :_p13_seq_len
+                ]
+                _p13_kv_swa = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    _p13_kv_full
+                )
+                state_indices = _p13_kv_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
             else:
                 state_indices = None
 
