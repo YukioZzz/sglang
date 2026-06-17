@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+# Native FP4 dot_scaled(e2m1) MoE path (gfx950) for SwiGLU-OAI models such as
+# MiniMax-M3, which the AITER W4A4 CK MoE cannot serve. Opt-in via env.
+_use_native_mxfp4 = get_bool_env_var("SGLANG_MXFP4_NATIVE") and is_gfx95_supported()
 
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
@@ -218,6 +221,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         return online_mxfp4_moe_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _use_native_mxfp4:
+            # Native dot_scaled(e2m1) consumes plain packed FP4 weights + plain
+            # E8M0 scales -- skip the AITER shuffle/swizzle.
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                )
+            return
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
@@ -268,6 +279,33 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if _use_native_mxfp4:
+            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp4_moe_amd_gfx95 import (
+                fused_experts_mxfp4,
+            )
+            from sglang.srt.layers.moe.token_dispatcher.standard import (
+                StandardCombineInput,
+            )
+
+            topk_output = dispatch_output.topk_output
+            cfg = self.moe_runner_config
+            out = fused_experts_mxfp4(
+                dispatch_output.hidden_states,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                activation=cfg.activation,
+                is_gated=cfg.is_gated,
+                gemm1_alpha=cfg.gemm1_alpha,
+                gemm1_limit=cfg.gemm1_clamp_limit,
+                interleaved=cfg.interleaved,
+                expert_map=getattr(layer, "expert_map", None),
+            )
+            return StandardCombineInput(hidden_states=out)
+
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
