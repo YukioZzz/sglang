@@ -1756,6 +1756,8 @@ piecewise_cuda_graph_disabled_model_archs = [
 # cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
 multimodal_piecewise_cuda_graph_supported_model_archs = [
     "Cohere2VisionForConditionalGeneration",
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
