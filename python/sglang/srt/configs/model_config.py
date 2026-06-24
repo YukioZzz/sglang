@@ -1818,14 +1818,6 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
     )
 
 
-# Multimodal archs whose LM-decoder prefill is validated under piecewise CUDA
-# graph (capture wraps only the decoder; the image encoder runs eager).
-multimodal_piecewise_cuda_graph_supported_archs = [
-    "MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration",
-]
-
-
 def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):
     """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
     return any(
