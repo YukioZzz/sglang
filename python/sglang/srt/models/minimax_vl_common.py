@@ -63,6 +63,12 @@ class CLIPVisionConfig:
     def from_dict(cls, d: dict) -> "CLIPVisionConfig":
         valid_keys = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in d.items() if k in valid_keys}
+        # Newer configs nest RoPE under "rope_parameters" instead of a flat
+        # "rope_theta"; pull it out so the required field still resolves.
+        if "rope_theta" not in filtered and isinstance(d.get("rope_parameters"), dict):
+            rope_theta = d["rope_parameters"].get("rope_theta")
+            if rope_theta is not None:
+                filtered["rope_theta"] = rope_theta
         return cls(**filtered)
 
 

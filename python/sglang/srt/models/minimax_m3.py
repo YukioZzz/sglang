@@ -944,16 +944,21 @@ class MiniMaxM3Attention(nn.Module):
         if getattr(qm, "convert_mxfp8_to_block", False):
             return
 
+        # Only unquantized bf16 and mxfp8 support the output-dim concat below.
+        # Packed quants (auto-round / GPTQ / AWQ) expose .qweight, not .weight, so
+        # bail before the cat to keep the two separate GEMMs instead of raising.
+        is_unquant = isinstance(qm, UnquantizedLinearMethod)
+        use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
+        if not (is_unquant or use_mxfp8):
+            return
+
         weight = torch.cat([qp.weight.data, ip.weight.data], dim=0).contiguous()
-        if isinstance(qm, UnquantizedLinearMethod):
+        if is_unquant:
             scale = None
-        elif getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv"):
+        else:
             scale = torch.cat(
                 [qp.weight_scale_inv.data, ip.weight_scale_inv.data], dim=0
             ).contiguous()
-        else:
-            # Unsupported quant (e.g. non-mxfp8 fp8 block) -> keep two GEMMs.
-            return
 
         # input_size_per_partition / orig_dtype are set by the quant method's
         # create_weights (fp8) but not by UnquantizedLinearMethod; fall back to
