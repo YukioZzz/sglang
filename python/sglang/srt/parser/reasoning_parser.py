@@ -501,6 +501,18 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
 
 
 class MiniMaxM3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for MiniMax-M3.
+    Reasoning format: (<mm:think>)*(.*)</mm:think>
+
+    In multi-turn conversations M3's chat template renders earlier non-thinking
+    assistant turns prefixed with a bare ``</mm:think>``, so the model imitates
+    that and can open a fresh non-thinking reply with one stray ``</mm:think>``.
+    Drop that single leading closer when we are not in a reasoning block, else it
+    leaks into content. (With thinking active we are already in a reasoning block
+    and the closer is consumed normally.)
+    """
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -516,6 +528,32 @@ class MiniMaxM3Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
+        self._lead_buffer = ""
+        self._checked_leading_close = False
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        if not self._in_reasoning and text.lstrip().startswith(self.think_end_token):
+            text = text.lstrip()[len(self.think_end_token) :]
+        return super().detect_and_parse(text)
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        # ``</mm:think>`` is a single token, so a stray leading closer arrives
+        # whole; only buffer leading whitespace until the first real token
+        # reveals whether it is that closer.
+        if not self._checked_leading_close and not self._in_reasoning:
+            self._lead_buffer += new_text
+            stripped = self._lead_buffer.lstrip()
+            if not stripped:
+                return StreamingParseResult()
+            self._checked_leading_close = True
+            if stripped.startswith(self.think_end_token):
+                new_text = stripped[len(self.think_end_token) :]
+            else:
+                new_text = self._lead_buffer
+            self._lead_buffer = ""
+            if not new_text:
+                return StreamingParseResult()
+        return super().parse_streaming_increment(new_text)
 
 
 class MistralDetector(BaseReasoningFormatDetector):
