@@ -55,9 +55,6 @@ class MinimaxM3Detector(BaseFormatDetector):
     TAG_SPACING_CHARS = " \t\r\n"
     TAG_SPACING_RE = re.compile(re.escape(MINIMAX_NS_TOKEN) + r"[ \t\r\n]+(?=<)")
 
-    # Matches <invoke name="...">
-    INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)">')
-
     def __init__(self):
         super().__init__()
         self._in_tool_call = False

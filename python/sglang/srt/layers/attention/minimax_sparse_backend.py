@@ -42,7 +42,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
         )
         self.score_type: str = get_minimax_sparse_score_type(sparse_cfg)
-        # assert self.idx_head_dim == head_dim
 
         # max_seqlen for the current forward pass, stored as a plain Python int
         # so that it is safe to use inside CUDA graphs (no .item() at graph time).
@@ -79,8 +78,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         # MSA (fmha_sm100) is bf16/fp16-only. With an fp8 main KV cache
         # (--kv-cache-dtype fp8_*) keep the sparse path on Triton (it dequants fp8 on
-        # load) rather than feeding fp8 bytes to the bf16 kernel; mirrors vLLM's
-        # select_main_impl_cls (fp8 KV -> Triton, never MSA).
+        # load) rather than feeding fp8 bytes to the bf16 kernel (fp8 KV -> Triton,
+        # never MSA).
         _main_kv_is_fp8 = self.kv_pool.main_pool.dtype in (
             torch.float8_e4m3fn,
             torch.float8_e5m2,

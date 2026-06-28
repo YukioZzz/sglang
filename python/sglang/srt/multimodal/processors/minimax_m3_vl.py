@@ -54,7 +54,6 @@ def get_hw_multiple_of(
         new_h = round_up(round(h * ratio), multiple)
         return new_w, new_h
 
-    # Round up to nearest multiple
     new_w = round_up(w, multiple)
     new_h = round_up(h, multiple)
 
@@ -86,28 +85,6 @@ def get_hw_multiple_of(
         assert new_w <= max_w and new_h <= max_h
 
     return new_w, new_h
-
-
-def vllm_resize(
-    height: int,
-    width: int,
-    factor: int,
-    max_size: Tuple[int, int],
-) -> Tuple[int, int]:
-    """
-    Wrapper around get_hw_multiple_of.
-
-    Args:
-        height: Image height
-        width: Image width
-        factor: Alignment factor (patch_size * merge_size)
-        max_size: (max_width, max_height) constraint
-
-    Returns:
-        Tuple[int, int]: (new_height, new_width)
-    """
-    new_w, new_h = get_hw_multiple_of((width, height), factor, max_size)
-    return new_h, new_w
 
 
 def _compute_sampled_frame_indices(
@@ -233,7 +210,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
     SGLang Multimodal Processor for MiniMax M3 VL.
 
     Uses local MiniMaxM2VL{Image,Video}Processor classes (copied from Qwen2VL)
-    with resize logic changed to vLLM's get_hw_multiple_of.
+    with resize logic replaced by get_hw_multiple_of.
     """
 
     models = [
@@ -358,7 +335,6 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
-        # Step 3: Call base process_and_combine_mm_data which uses self._processor
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output=base_output,
             mm_tokens=self.mm_tokens,

@@ -357,7 +357,7 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_alpha=config.swiglu_alpha,
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
-            interleaved=False,
+            gate_up_interleaved=False,
         )
         # use sigmoid_topk, instead of grouped_topk
         self.topk = TopK(
@@ -521,7 +521,6 @@ class MiniMaxM3Attention(nn.Module):
         self.attn_tp_size = attn_tp_size
         self.attn_tp_rank = attn_tp_rank
 
-        # Get dimensions from config
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -537,7 +536,6 @@ class MiniMaxM3Attention(nn.Module):
             assert attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
 
-        # Use head_dim from config if available, otherwise calculate
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
         )
@@ -545,15 +543,12 @@ class MiniMaxM3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        # RoPE settings - support partial RoPE
         self.rope_theta, self.rope_scaling = get_rope_config(config)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim
         )  # MiniMax uses rotary_dim=64
 
-        # QK Normalization settings
-        self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
@@ -658,7 +653,6 @@ class MiniMaxM3Attention(nn.Module):
                 )
             self.index_rotary_emb = self.rotary_emb
 
-        # QK Normalization layers
         # Use RMSNormTP for proper tensor parallel support
         # Use total dimensions (before TP sharding) for correct normalization
         if self.qk_norm_type == "per_layer":
@@ -1415,7 +1409,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Self Attention
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -1433,7 +1426,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Fully Connected (MLP or MoE)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -1447,7 +1439,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             # Sparse MoE produces partial expert outputs per rank; deferring the
             # all-reduce into the next layer's fusion corrupts those partials and
             # re-triggers the M3 no-EOS runaway. Force the immediate all-reduce in
-            # MiniMaxM3MoE.forward_normal (aligns with vLLM). Dense MLP keeps fusion.
+            # MiniMaxM3MoE.forward_normal. Dense MLP keeps fusion.
             should_allreduce_fusion = False
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
