@@ -914,11 +914,6 @@ class Envs:
     # from the top-k block selection. Requires a paged KV cache (page_size>1), i.e.
     # the trtllm_mha / fa3 backends; no-op (custom kernel) otherwise.
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
-    # MiniMax-M3 attention: fuse per-head GemmaRMSNorm(q,k) + partial NeoX RoPE
-    # into one in-place JIT kernel (minimax_qknorm_rope) instead of separate
-    # norm + rope launches. Only activates for the verified config (per_head
-    # gemma norm, head_dim=128, rotary_dim=64, neox, no output gate, fp32 cache).
-    SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE = EnvBool(True)
     # MiniMax-M3 main sparse attention: force the Triton path even when MiniMax's
     # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
     # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.

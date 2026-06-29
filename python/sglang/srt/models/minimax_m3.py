@@ -726,7 +726,6 @@ class MiniMaxM3Attention(nn.Module):
         # call time.
         self._use_fused_qknorm_rope = (
             _is_cuda
-            and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE.get()
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
             and self.head_dim == 128
