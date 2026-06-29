@@ -92,6 +92,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and self.topk_blocks in (4, 8, 16, 32)
             and not _main_kv_is_fp8
         )
+        if (
+            not self.use_msa
+            and not envs.SGLANG_DISABLE_MSA.get()
+            and msa_available()
+            and self.block_size_k == 128
+            and self.kv_pool.page_size != self.block_size_k
+        ):
+            logger.warning(
+                "MiniMax-M3 MSA decode disabled: page_size=%d != sparse block size "
+                "%d. Pass --page-size 128 (with an attention backend that allows it, "
+                "e.g. fa4) to enable the faster MSA kernel; falling back to the "
+                "Triton sparse path.",
+                self.kv_pool.page_size,
+                self.block_size_k,
+            )
         # Per-forward MSA decode metadata (page table + fmha plan), shared by every
         # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
         self._msa_dec_meta = None
