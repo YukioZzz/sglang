@@ -3736,6 +3736,21 @@ class ServerArgs:
                     f"{self.attention_backend}, page_size={self.page_size}, "
                     f"moe_runner_backend={self.moe_runner_backend}."
                 )
+            elif is_sm90_supported():
+                # Hopper: the MSA kernel (fmha_sm100) is SM100-only, so the sparse
+                # step always runs the Triton path. fa3 is the Hopper flash backend
+                # and accepts page_size == sparse block size == 128 (which the sparse
+                # KV pool needs); trtllm_mha would pin page_size to 64 and silently
+                # drop the sparse decode to the slower fallback.
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "fa3"
+                if self.page_size is None and self.attention_backend == "fa3":
+                    self.page_size = 128
+                logger.info(
+                    "MiniMax-M3 on Hopper: attention_backend="
+                    f"{self.attention_backend}, page_size={self.page_size} "
+                    "(MSA is SM100-only; sparse attention runs on the Triton path)."
+                )
 
             # bf16: deep_gemm's grouped-masked GEMM is corrupt for M3 (only mxfp8 is
             # validated), so pin triton whether the runner was left auto or set to deep_gemm.
