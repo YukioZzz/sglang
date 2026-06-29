@@ -890,11 +890,6 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # deep_gemm MoE combine: use the 2-D-grid, fp32-accumulation post_reorder
-    # kernel with routed_scaling_factor fused into the store (post_reorder_deepgemm),
-    # instead of the 1-program-per-token post_reorder_triton_kernel followed by a
-    # separate full-tensor `output *= routed_scaling_factor` pass.
-    SGLANG_OPT_USE_FUSED_DEEPGEMM_POST_REORDER = EnvBool(True)
     # Replace the sort-based dispatch-index chain (torch.sort + compute_seg_indptr
     # + compute_masked_m + deepgemm_compute_src2dst) in moe_ep_deepgemm_preprocess
     # with a single atomic-cursor kernel (fused_moe_dispatch_index).

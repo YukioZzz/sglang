@@ -715,7 +715,7 @@ def post_permute_deep_gemm_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states_shape = running_state["hidden_states_shape"]
@@ -728,44 +728,23 @@ def post_permute_deep_gemm_to_standard(
     output = torch.empty(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
-    if envs.SGLANG_OPT_USE_FUSED_DEEPGEMM_POST_REORDER.get():
-        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_deepgemm
-
-        # Fused 2-D-grid + fp32 accumulation + routed_scaling_factor folded in.
-        post_reorder_deepgemm(
-            runner_output.hidden_states,
-            output,
-            src2dst,
-            topk_ids,
-            topk_weights,
-            runner_config.top_k,
-            hidden_states_shape[0],
-            hidden_states_shape[1],
-            (
-                runner_config.routed_scaling_factor
-                if runner_config.routed_scaling_factor is not None
-                else 1.0
-            ),
-        )
-        dispose_tensor(runner_output.hidden_states)
-    else:
-        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
-
-        post_reorder_triton_kernel[(hidden_states_shape[0],)](
-            runner_output.hidden_states,
-            output,
-            src2dst,
-            topk_ids,
-            topk_weights,
-            runner_config.top_k,
-            hidden_states_shape[1],
-            BLOCK_SIZE=512,
-        )
-
-        dispose_tensor(runner_output.hidden_states)
-
-        if runner_config.routed_scaling_factor is not None:
-            output *= runner_config.routed_scaling_factor
+    # Fused 2-D-grid + fp32 accumulation + routed_scaling_factor folded in.
+    post_reorder_deepgemm(
+        runner_output.hidden_states,
+        output,
+        src2dst,
+        topk_ids,
+        topk_weights,
+        runner_config.top_k,
+        hidden_states_shape[0],
+        hidden_states_shape[1],
+        (
+            runner_config.routed_scaling_factor
+            if runner_config.routed_scaling_factor is not None
+            else 1.0
+        ),
+    )
+    dispose_tensor(runner_output.hidden_states)
 
     return StandardCombineInput(
         hidden_states=output,
