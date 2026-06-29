@@ -890,10 +890,6 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # Replace the sort-based dispatch-index chain (torch.sort + compute_seg_indptr
-    # + compute_masked_m + deepgemm_compute_src2dst) in moe_ep_deepgemm_preprocess
-    # with a single atomic-cursor kernel (fused_moe_dispatch_index).
-    SGLANG_OPT_USE_FUSED_MOE_DISPATCH_INDEX = EnvBool(True)
     # Route the plain (no silu-fuse, no masked-layout) per-token-group fp8/UE8M0
     # activation quant through the optimized JIT kernel instead of the AOT v2
     # kernel. Byte-identical output; ~1.3-3.9x faster (the [8192,6144] group=32

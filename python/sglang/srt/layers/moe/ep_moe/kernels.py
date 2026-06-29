@@ -4,7 +4,6 @@ from typing import Tuple
 import torch
 import triton
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
 logger = logging.getLogger(__name__)
@@ -181,23 +180,6 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     )
     reorder_topk_ids = reorder_topk_ids[num_minus_one:]
     return reorder_topk_ids, src2dst, seg_indptr
-
-
-@triton.jit
-def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
-    expert_id_minus_1 = tl.program_id(0) - 1
-    low = 0
-    high = num_toks - 1
-    target_location = -1
-    while low <= high:
-        mid = (low + high) // 2
-
-        if tl.load(reorder_topk_ids + mid) > expert_id_minus_1:
-            high = mid - 1
-        else:
-            low = mid + 1
-            target_location = mid
-    tl.store(seg_indptr + expert_id_minus_1 + 1, target_location + 1)
 
 
 def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
@@ -1398,35 +1380,6 @@ def tma_align_input_scale(input_scale: torch.Tensor):
 
 
 @triton.jit
-def compute_masked_m_triton_kernel(seg_indptr, masked_m):
-    expert_id = tl.program_id(0)
-    start = tl.load(seg_indptr + expert_id)
-    end = tl.load(seg_indptr + expert_id + 1)
-    tl.store(masked_m + expert_id, (end - start))
-
-
-@triton.jit
-def deepgemm_compute_src2dst_triton_kernel(
-    topk_ids,
-    reorder_ids,
-    seg_indptr,
-    src2dst,
-    m_max,
-    num_toks,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = dst_id < num_toks
-    src_id = tl.load(reorder_ids + dst_id, mask=mask)
-    expert_id = tl.load(topk_ids + src_id, mask=(src_id < num_toks))
-    expert_dst_start = tl.load(seg_indptr + expert_id, mask=(expert_id >= 0))
-    expert_dst_offset = dst_id - expert_dst_start
-    dst_id = expert_id * m_max + expert_dst_offset
-    tl.store(src2dst + src_id, dst_id, mask=mask)
-
-
-@triton.jit
 def fused_moe_dispatch_index_triton_kernel(
     topk_ids_ptr,  # flat (num_toks,) int32, expert id per (token, slot); -1 = padding
     src2dst_ptr,  # flat (num_toks,) int32, written: dst slot in the padded buffer
@@ -1599,37 +1552,8 @@ def moe_ep_deepgemm_preprocess(
     m_max = (hidden_states.size(0) // 256 + 1) * 256
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
 
-    if envs.SGLANG_OPT_USE_FUSED_MOE_DISPATCH_INDEX.get():
-        # Single atomic-cursor kernel in place of the sort-based chain below.
-        masked_m, src2dst = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
-    else:
-        reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
-        seg_indptr = torch.zeros(
-            num_local_experts + 1, device=topk_ids.device, dtype=torch.int64
-        )
-        src2dst = torch.empty(
-            topk_ids.numel(), device=topk_ids.device, dtype=torch.int32
-        )
-        masked_m = torch.empty(
-            num_local_experts, device=topk_ids.device, dtype=torch.int32
-        )
-
-        compute_seg_indptr_triton_kernel[(num_local_experts + 1,)](
-            reorder_topk_ids, seg_indptr, topk_ids.numel()
-        )
-
-        grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
-        compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
-
-        deepgemm_compute_src2dst_triton_kernel[grid](
-            topk_ids,
-            reorder_ids,
-            seg_indptr,
-            src2dst,
-            m_max,
-            topk_ids.numel(),
-            BLOCK_SIZE=256,
-        )
+    # Single atomic-cursor kernel computes (masked_m, src2dst) directly.
+    masked_m, src2dst = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
 
     gateup_input = torch.empty(
         (num_local_experts, m_max, hidden_states.size(1)),
