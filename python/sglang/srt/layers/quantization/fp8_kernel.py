@@ -565,6 +565,9 @@ def sglang_per_token_group_quant_fp8(
         and masked_m is None
         and x.dim() == 2
         and group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+        # The V1 JIT kernel only implements column-major UE8M0; row-major UE8M0
+        # must fall through to the V2 kernel, which supports both layouts.
+        and not (scale_ue8m0 and not column_major_scales)
     )
 
     if x.shape[0] > 0:
