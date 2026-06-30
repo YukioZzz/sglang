@@ -1372,6 +1372,29 @@ class TestMiniMaxM3Detector(CustomTestCase):
         parser = ReasoningParser("minimax-m3")
         self.assertIsInstance(parser.detector, MiniMaxM3Detector)
 
+    def test_force_nonempty_content_via_chat_template_kwargs(self):
+        """force_nonempty_content must reach the M3 detector without a TypeError."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[ChatCompletionMessageUserParam(role="user", content="Hi")],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        parser = ReasoningParser("minimax-m3", request=request)
+        self.assertTrue(parser.detector._force_nonempty_content)
+
+    def test_force_nonempty_content_swaps_when_no_content(self):
+        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+
+        detector = MiniMaxM3Detector(force_reasoning=True, force_nonempty_content=True)
+        result = detector.detect_and_parse("only reasoning, no closer")
+        self.assertEqual(result.normal_text, "only reasoning, no closer")
+        self.assertEqual(result.reasoning_text or "", "")
+
 
 class TestReasoningParserAdvanced(CustomTestCase):
     """Additional tests for ReasoningParser init edge cases."""

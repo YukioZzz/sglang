@@ -519,6 +519,7 @@ class MiniMaxM3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<mm:think>",
@@ -530,11 +531,15 @@ class MiniMaxM3Detector(BaseReasoningFormatDetector):
         )
         self._lead_buffer = ""
         self._checked_leading_close = False
+        self._force_nonempty_content = force_nonempty_content
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         if not self._in_reasoning and text.lstrip().startswith(self.think_end_token):
             text = text.lstrip()[len(self.think_end_token) :]
-        return super().detect_and_parse(text)
+        ret = super().detect_and_parse(text)
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         # ``</mm:think>`` is a single token, so a stray leading closer arrives
